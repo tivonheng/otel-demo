@@ -173,3 +173,4 @@ Both services expose identical chaos endpoints:
 docker-compose down -v
 ```
 # otel-demo
+# otel-demo
