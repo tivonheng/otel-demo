@@ -1,0 +1,849 @@
+# Claude Code Prompt: 搭建 OpenTelemetry Java 微服务可观测性 Demo（增强版）
+
+请帮我创建一个完整的本地 Docker Compose 可观测性演示项目，用于验证 OpenTelemetry + Grafana 全家桶的 metrics/traces/logs 三大信号采集、存储、展示和关联跳转。这个 demo 需要涵盖真实微服务场景，包含 HTTP 跨服务调用、MySQL 数据库查询、Redis 缓存操作，展示 OTel Java Agent 的零代码自动 instrumentation 能力。此外每个服务需要预留故障注入 API，可以在运行时动态注入延迟、异常和错误率，用于模拟各种故障场景做可观测性演练。
+
+## 项目结构
+
+```
+otel-observability-demo/
+├── docker-compose.yml
+├── start.sh                           # 一键构建+启动脚本
+├── config/
+│   ├── otel-collector-config.yaml
+│   ├── tempo-config.yaml
+│   ├── loki-config.yaml
+│   ├── prometheus.yml
+│   ├── mysql/
+│   │   └── init.sql                   # MySQL 初始化脚本
+│   └── grafana/
+│       ├── datasources.yaml           # 预配置所有数据源和关联跳转
+│       └── dashboards/
+│           ├── dashboards.yaml        # dashboard provider 配置
+│           └── overview.json          # 预置概览 dashboard
+├── order-service/                      # 微服务 A - 订单服务
+│   ├── pom.xml
+│   ├── Dockerfile
+│   └── src/main/java/com/demo/order/
+│       ├── OrderServiceApplication.java
+│       ├── controller/
+│       │   ├── OrderController.java
+│       │   └── ChaosController.java   # 故障注入 API
+│       ├── service/
+│       │   └── OrderService.java
+│       ├── repository/
+│       │   └── OrderRepository.java
+│       ├── model/
+│       │   ├── Order.java
+│       │   └── CreateOrderRequest.java
+│       ├── chaos/
+│       │   └── ChaosMonkey.java       # 故障注入引擎
+│       └── config/
+│           └── RestTemplateConfig.java
+├── inventory-service/                  # 微服务 B - 库存服务
+│   ├── pom.xml
+│   ├── Dockerfile
+│   └── src/main/java/com/demo/inventory/
+│       ├── InventoryServiceApplication.java
+│       ├── controller/
+│       │   ├── InventoryController.java
+│       │   └── ChaosController.java   # 故障注入 API
+│       ├── service/
+│       │   └── InventoryService.java
+│       ├── repository/
+│       │   └── InventoryRepository.java
+│       ├── model/
+│       │   ├── InventoryItem.java
+│       │   └── ReserveRequest.java
+│       └── chaos/
+│           └── ChaosMonkey.java       # 故障注入引擎
+└── README.md
+```
+
+## 技术要求
+
+### 1. 基础设施服务
+
+#### MySQL 8（端口 3306）
+- 使用 `mysql:8.0` 镜像
+- 环境变量：MYSQL_ROOT_PASSWORD=root, MYSQL_DATABASE=demodb
+- 通过 init.sql 创建表结构和测试数据，挂载到 `/docker-entrypoint-initdb.d/`
+- 字符集设置：`--character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci`
+
+**init.sql**:
+```sql
+USE demodb;
+
+CREATE TABLE orders (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    user_id VARCHAR(50) NOT NULL,
+    sku VARCHAR(50) NOT NULL,
+    quantity INT NOT NULL,
+    status VARCHAR(20) DEFAULT 'PENDING',
+    total_price DECIMAL(10,2),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_user_id (user_id),
+    INDEX idx_sku (sku),
+    INDEX idx_status (status)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE inventory (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    sku VARCHAR(50) UNIQUE NOT NULL,
+    product_name VARCHAR(200) NOT NULL,
+    quantity INT NOT NULL,
+    price DECIMAL(10,2) NOT NULL,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    INDEX idx_sku (sku)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+INSERT INTO orders (user_id, sku, quantity, status, total_price) VALUES
+('user-001', 'SKU-001', 2, 'COMPLETED', 59.98),
+('user-002', 'SKU-003', 1, 'COMPLETED', 149.99),
+('user-001', 'SKU-002', 3, 'PENDING', 29.97),
+('user-003', 'SKU-004', 1, 'COMPLETED', 79.99),
+('user-002', 'SKU-001', 5, 'SHIPPED', 149.95);
+
+INSERT INTO inventory (sku, product_name, quantity, price) VALUES
+('SKU-001', 'Wireless Mouse', 100, 29.99),
+('SKU-002', 'USB-C Cable', 500, 9.99),
+('SKU-003', 'Mechanical Keyboard', 50, 149.99),
+('SKU-004', 'Monitor Stand', 30, 79.99),
+('SKU-005', 'Webcam HD', 0, 59.99);
+```
+
+#### Redis 7（端口 6379）
+- 使用 `redis:7-alpine` 镜像
+- 无需特殊配置，用于两个服务的缓存层
+
+### 2. 故障注入引擎（ChaosMonkey）— 两个服务共用同一套设计
+
+这是 demo 的核心特性之一。每个服务内嵌一个轻量的故障注入引擎，通过 REST API 在运行时动态开关，不需要重启服务。
+
+#### ChaosMonkey.java（单例 Bean，线程安全）
+
+```java
+@Component
+public class ChaosMonkey {
+
+    private final AtomicBoolean enabled = new AtomicBoolean(false);
+
+    // 故障注入配置
+    private volatile int latencyMs = 0;           // 注入的额外延迟（毫秒）
+    private volatile int latencyJitterMs = 0;     // 延迟抖动范围（毫秒）
+    private volatile double exceptionRate = 0.0;  // 异常抛出概率 0.0-1.0
+    private volatile String exceptionMessage = "Chaos monkey injected fault";
+    private volatile double httpErrorRate = 0.0;  // 返回 HTTP 500 的概率 0.0-1.0
+    private volatile int httpErrorCode = 500;     // 返回的 HTTP 错误码
+
+    private final Random random = new ThreadLocalRandom.current();
+
+    // 在业务方法入口处调用此方法
+    public void maybeInjectFault() {
+        if (!enabled.get()) return;
+
+        // 注入延迟
+        if (latencyMs > 0) {
+            int jitter = latencyJitterMs > 0 ? random.nextInt(latencyJitterMs) : 0;
+            try {
+                Thread.sleep(latencyMs + jitter);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
+
+        // 注入异常
+        if (exceptionRate > 0 && random.nextDouble() < exceptionRate) {
+            throw new RuntimeException(exceptionMessage);
+        }
+    }
+
+    // 检查是否应该返回 HTTP 错误（在 Controller 层调用）
+    public Optional<Integer> maybeHttpError() {
+        if (!enabled.get()) return Optional.empty();
+        if (httpErrorRate > 0 && random.nextDouble() < httpErrorRate) {
+            return Optional.of(httpErrorCode);
+        }
+        return Optional.empty();
+    }
+
+    // getter/setter/reset 方法...
+    public ChaosConfig getConfig() { ... }
+    public void updateConfig(ChaosConfig config) { ... }
+    public void reset() { /* 恢复所有默认值，disabled */ }
+}
+```
+
+#### ChaosController.java（故障注入 REST API）
+
+```java
+@RestController
+@RequestMapping("/chaos")
+public class ChaosController {
+
+    private final ChaosMonkey chaosMonkey;
+
+    // GET /chaos/status — 查看当前故障注入状态
+    @GetMapping("/status")
+    public ChaosConfig getStatus() { ... }
+
+    // POST /chaos/enable — 启用故障注入
+    @PostMapping("/enable")
+    public ResponseEntity<String> enable() { ... }
+
+    // POST /chaos/disable — 禁用故障注入（恢复正常）
+    @PostMapping("/disable")
+    public ResponseEntity<String> disable() { ... }
+
+    // POST /chaos/latency — 注入延迟
+    // Body: {"latencyMs": 3000, "jitterMs": 1000}
+    @PostMapping("/latency")
+    public ResponseEntity<String> setLatency(@RequestBody LatencyConfig config) { ... }
+
+    // POST /chaos/exception — 注入异常
+    // Body: {"rate": 0.5, "message": "Database connection timeout"}
+    @PostMapping("/exception")
+    public ResponseEntity<String> setException(@RequestBody ExceptionConfig config) { ... }
+
+    // POST /chaos/http-error — 注入 HTTP 错误码
+    // Body: {"rate": 0.3, "statusCode": 503}
+    @PostMapping("/http-error")
+    public ResponseEntity<String> setHttpError(@RequestBody HttpErrorConfig config) { ... }
+
+    // POST /chaos/reset — 重置所有故障注入（关闭并清除配置）
+    @PostMapping("/reset")
+    public ResponseEntity<String> reset() { ... }
+
+    // POST /chaos/scenario/{name} — 预置故障场景一键注入
+    // 支持的 scenario: "slow-db", "redis-timeout", "cascade-failure", "high-error-rate"
+    @PostMapping("/scenario/{name}")
+    public ResponseEntity<String> applyScenario(@PathVariable String name) { ... }
+}
+```
+
+**预置故障场景说明**：
+
+- `slow-db`: 启用 3000ms + 1000ms jitter 的延迟，模拟数据库慢查询
+- `redis-timeout`: 启用 5000ms 延迟，模拟 Redis 连接超时
+- `cascade-failure`: 启用 80% 异常率，message="Connection refused"，模拟级联故障
+- `high-error-rate`: 启用 50% HTTP 503 错误率，模拟服务过载
+
+### 3. Java 微服务详细设计
+
+两个 Spring Boot 3.x + JDK 17 微服务。**不在代码中引入任何 OTel trace/metrics SDK 依赖**，全部通过 javaagent 零代码注入。
+
+#### order-service（端口 8080）
+
+**API 接口**:
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/api/orders` | 查询所有订单（分页，DB 查询 trace） |
+| GET | `/api/orders/{id}` | 查询单个订单（Redis 缓存 + DB fallback） |
+| POST | `/api/orders` | 创建订单（跨服务调用 + DB 写入 + 缓存操作） |
+| GET | `/api/orders/user/{userId}` | 按用户查询订单（DB 查询 trace） |
+| GET | `/api/orders/slow` | 模拟慢查询（固定延迟，不受 chaos 控制） |
+| GET | `/chaos/status` | 查看故障注入状态 |
+| POST | `/chaos/enable` | 启用故障注入 |
+| POST | `/chaos/disable` | 禁用故障注入 |
+| POST | `/chaos/latency` | 注入延迟 |
+| POST | `/chaos/exception` | 注入异常 |
+| POST | `/chaos/http-error` | 注入 HTTP 错误码 |
+| POST | `/chaos/reset` | 重置所有故障注入 |
+| POST | `/chaos/scenario/{name}` | 一键注入预置故障场景 |
+
+**业务逻辑**:
+
+1. `GET /api/orders/{id}`：先查 Redis（key: `order:{id}`，TTL 60s），miss 则查 MySQL 并回填缓存
+2. `POST /api/orders`：
+   - 调用 `chaosMonkey.maybeInjectFault()` — 故障注入检查点
+   - REST 调用 inventory-service `GET /api/inventory/{sku}` 检查库存和价格
+   - REST 调用 inventory-service `POST /api/inventory/reserve` 扣减库存
+   - INSERT 订单到 MySQL，total_price = price × quantity
+   - 删除相关 Redis 缓存
+   - 捕获所有异常，返回合适的 HTTP 错误码
+3. `GET /api/orders/slow`：Thread.sleep(2000-5000ms 随机)，模拟慢查询，用于演示延迟 trace
+
+**关键日志点（SLF4J Logger）**:
+```java
+log.info("Querying order by id={}", id);
+log.info("Cache HIT for order id={}", id);
+log.info("Cache MISS for order id={}, querying database", id);
+log.info("Creating order: user={}, sku={}, quantity={}", userId, sku, quantity);
+log.info("Calling inventory-service to check stock for sku={}", sku);
+log.info("Calling inventory-service to reserve stock for sku={}", sku);
+log.info("Order created successfully: orderId={}, totalPrice={}", order.getId(), order.getTotalPrice());
+log.warn("Inventory check failed for sku={}: {}", sku, response.getStatusCode());
+log.error("Order creation failed for user={}, sku={}: {}", userId, sku, e.getMessage());
+```
+
+**使用 RestTemplate**（OTel Agent 自动 instrument RestTemplate 调用）调用 inventory-service，注意配置合理的超时：
+```java
+@Configuration
+public class RestTemplateConfig {
+    @Bean
+    public RestTemplate restTemplate(RestTemplateBuilder builder) {
+        return builder
+            .connectTimeout(Duration.ofSeconds(5))
+            .readTimeout(Duration.ofSeconds(10))
+            .build();
+    }
+}
+```
+
+#### inventory-service（端口 8081）
+
+**API 接口**:
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/api/inventory` | 查询所有库存 |
+| GET | `/api/inventory/{sku}` | 查询单品库存（Redis 缓存 + DB fallback） |
+| POST | `/api/inventory/reserve` | 扣减库存（DB 更新 + 缓存更新） |
+| GET | `/chaos/status` | 查看故障注入状态 |
+| POST | `/chaos/enable` | 启用故障注入 |
+| POST | `/chaos/disable` | 禁用故障注入 |
+| POST | `/chaos/latency` | 注入延迟 |
+| POST | `/chaos/exception` | 注入异常 |
+| POST | `/chaos/http-error` | 注入 HTTP 错误码 |
+| POST | `/chaos/reset` | 重置所有故障注入 |
+| POST | `/chaos/scenario/{name}` | 一键注入预置故障场景 |
+
+**业务逻辑**:
+
+1. `GET /api/inventory/{sku}`：先查 Redis（key: `inventory:{sku}`，TTL 120s），miss 则查 MySQL 并回填缓存
+2. `POST /api/inventory/reserve`：
+   - 调用 `chaosMonkey.maybeInjectFault()` — 故障注入检查点
+   - 查询当前库存
+   - 库存不足返回 409 Conflict + JSON body `{"error": "Insufficient stock", "available": n, "requested": m}`
+   - 库存充足则更新数量，更新 Redis 缓存
+3. 额外：在所有 GET 请求中加入 30-200ms 随机延迟，模拟真实 DB 查询耗时
+
+**关键日志点**:
+```java
+log.info("Checking inventory for sku={}", sku);
+log.info("Inventory cache HIT for sku={}", sku);
+log.info("Inventory cache MISS for sku={}, querying database", sku);
+log.info("Reserving {} units for sku={}", quantity, sku);
+log.info("Reservation successful: sku={}, remaining={}", sku, remaining);
+log.warn("Insufficient stock: sku={}, available={}, requested={}", sku, available, requested);
+log.error("Inventory operation failed: {}", e.getMessage());
+```
+
+#### 两个服务通用配置
+
+**pom.xml 公共依赖**:
+```xml
+<parent>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-parent</artifactId>
+    <version>3.3.5</version>
+</parent>
+
+<dependencies>
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-web</artifactId>
+    </dependency>
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-data-jpa</artifactId>
+    </dependency>
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-data-redis</artifactId>
+    </dependency>
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-actuator</artifactId>
+    </dependency>
+    <dependency>
+        <groupId>io.micrometer</groupId>
+        <artifactId>micrometer-registry-prometheus</artifactId>
+    </dependency>
+    <dependency>
+        <groupId>com.mysql</groupId>
+        <artifactId>mysql-connector-j</artifactId>
+        <scope>runtime</scope>
+    </dependency>
+    <!-- 唯一的 OTel 依赖：仅用于日志 appender，不影响零代码 trace -->
+    <dependency>
+        <groupId>io.opentelemetry.instrumentation</groupId>
+        <artifactId>opentelemetry-logback-appender-1.0</artifactId>
+        <version>2.12.0-alpha</version>
+        <scope>runtime</scope>
+    </dependency>
+</dependencies>
+```
+
+**application.yml（order-service 示例，inventory-service 类似）**:
+```yaml
+server:
+  port: 8080
+
+spring:
+  application:
+    name: order-service
+  datasource:
+    url: jdbc:mysql://mysql:3306/demodb?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC
+    username: root
+    password: root
+    driver-class-name: com.mysql.cj.jdbc.Driver
+  jpa:
+    hibernate:
+      ddl-auto: none
+    show-sql: false
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.MySQLDialect
+  data:
+    redis:
+      host: redis
+      port: 6379
+      timeout: 5000ms
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus
+  metrics:
+    tags:
+      application: ${spring.application.name}
+
+inventory-service:
+  url: http://inventory-service:8081
+```
+
+**Logback 配置（logback-spring.xml）**:
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+    <include resource="org/springframework/boot/logging/logback/defaults.xml"/>
+    <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>%d{HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg traceID=%X{trace_id} spanID=%X{span_id}%n</pattern>
+        </encoder>
+    </appender>
+    <appender name="OpenTelemetry"
+              class="io.opentelemetry.instrumentation.logback.appender.v1_0.OpenTelemetryAppender">
+        <captureExperimentalAttributes>true</captureExperimentalAttributes>
+        <captureCodeAttributes>true</captureCodeAttributes>
+    </appender>
+    <root level="INFO">
+        <appender-ref ref="CONSOLE"/>
+        <appender-ref ref="OpenTelemetry"/>
+    </root>
+</configuration>
+```
+
+**Dockerfile（两个服务共用模板）**:
+```dockerfile
+FROM eclipse-temurin:17-jre-alpine
+WORKDIR /app
+ADD https://github.com/open-telemetry/opentelemetry-java-instrumentation/releases/latest/download/opentelemetry-javaagent.jar /app/opentelemetry-javaagent.jar
+COPY target/*.jar /app/app.jar
+EXPOSE 8080
+ENTRYPOINT ["java", "-javaagent:/app/opentelemetry-javaagent.jar", "-jar", "/app/app.jar"]
+```
+
+**docker-compose 中 Java 服务的 OTel 环境变量**:
+```yaml
+environment:
+  OTEL_SERVICE_NAME: order-service  # 或 inventory-service
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+  OTEL_EXPORTER_OTLP_PROTOCOL: grpc
+  OTEL_LOGS_EXPORTER: otlp
+  OTEL_METRICS_EXPORTER: otlp
+  OTEL_TRACES_EXPORTER: otlp
+  OTEL_RESOURCE_ATTRIBUTES: "deployment.environment=demo,service.version=1.0.0"
+  OTEL_INSTRUMENTATION_COMMON_PEER_SERVICE_MAPPING: "mysql:3306=mysql,redis:6379=redis"
+  JAVA_TOOL_OPTIONS: "-javaagent:/app/opentelemetry-javaagent.jar"
+```
+
+### 4. OpenTelemetry Collector
+
+使用 `otel/opentelemetry-collector-contrib:latest` 镜像。
+
+**otel-collector-config.yaml**:
+```yaml
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch:
+    timeout: 5s
+    send_batch_size: 1024
+  resource:
+    attributes:
+      - key: deployment.environment
+        value: "demo"
+        action: upsert
+
+exporters:
+  otlphttp/tempo:
+    endpoint: http://tempo:4318
+  otlphttp/loki:
+    endpoint: http://loki:3100/otlp
+  prometheus:
+    endpoint: 0.0.0.0:8889
+    resource_to_telemetry_conversion:
+      enabled: true
+  debug:
+    verbosity: basic
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch, resource]
+      exporters: [otlphttp/tempo]
+    logs:
+      receivers: [otlp]
+      processors: [batch, resource]
+      exporters: [otlphttp/loki]
+    metrics:
+      receivers: [otlp]
+      processors: [batch, resource]
+      exporters: [prometheus]
+```
+
+### 5. Grafana Tempo
+
+使用 `grafana/tempo:latest`，单节点模式。
+
+**tempo-config.yaml 关键配置**:
+- stream_over_http_enabled: true
+- 接收 OTLP HTTP（端口 4318）
+- 本地文件存储 /var/tempo
+- 启用 metrics_generator：
+  - processor: service-graphs, span-metrics
+  - remote_write endpoint: http://prometheus:9090/api/v1/write
+- search 和 query_frontend 启用
+
+### 6. Grafana Loki
+
+使用 `grafana/loki:3.0.0` 或 latest，单节点模式。
+
+**loki-config.yaml 关键配置**:
+- 开启 OTLP 接收端
+- limits_config.allow_structured_metadata: true
+- 本地存储
+
+### 7. Prometheus
+
+使用 `prom/prometheus:latest`。
+
+**prometheus.yml 抓取目标**:
+- otel-collector:8889
+- order-service:8080/actuator/prometheus
+- inventory-service:8081/actuator/prometheus
+- tempo:3200/metrics
+
+**启动参数**:
+- `--enable-feature=exemplar-storage`
+- `--web.enable-remote-write-receiver`（接收 Tempo metrics-generator 数据）
+- `--storage.tsdb.retention.time=1d`
+
+### 8. Grafana
+
+使用 `grafana/grafana:latest`。
+
+**datasources.yaml — 三大信号关联跳转（最关键的配置）**:
+
+```yaml
+apiVersion: 1
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    jsonData:
+      exemplarTraceIdDestinations:
+        - name: traceID
+          datasourceUid: tempo
+      httpMethod: POST
+
+  - name: Tempo
+    type: tempo
+    access: proxy
+    uid: tempo
+    url: http://tempo:3200
+    jsonData:
+      tracesToLogsV2:
+        datasourceUid: loki
+        spanStartTimeShift: "-1h"
+        spanEndTimeShift: "1h"
+        filterByTraceID: true
+        filterBySpanID: false
+        tags:
+          - key: "service.name"
+            value: "service_name"
+      tracesToMetrics:
+        datasourceUid: prometheus
+        spanStartTimeShift: "-1h"
+        spanEndTimeShift: "1h"
+        tags:
+          - key: "service.name"
+            value: "service_name"
+        queries:
+          - name: "Request rate"
+            query: "sum(rate(http_server_request_duration_seconds_count{$$__tags}[5m]))"
+          - name: "Error rate"
+            query: "sum(rate(http_server_request_duration_seconds_count{$$__tags,http_response_status_code=~\"5..\"}[5m]))"
+      nodeGraph:
+        enabled: true
+      serviceMap:
+        datasourceUid: prometheus
+
+  - name: Loki
+    type: loki
+    access: proxy
+    uid: loki
+    url: http://loki:3100
+    jsonData:
+      derivedFields:
+        - name: TraceID
+          datasourceUid: tempo
+          matcherRegex: "traceID=(\\w+)"
+          url: "$${__value.raw}"
+          matcherType: "regex"
+```
+
+**预置 Dashboard（overview.json）**:
+- Row 1 总览：QPS（按 service 分组）、错误率、P95/P99 延迟（开启 exemplars）
+- Row 2 数据库 & Redis：DB 查询延迟、Redis 命令延迟、连接池指标（如果可用）
+- Row 3 Traces & Logs：最近 Traces 列表（Tempo）、最近错误日志（Loki `level=ERROR`）
+
+**Grafana 环境变量**:
+```yaml
+GF_AUTH_ANONYMOUS_ENABLED: "true"
+GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+GF_AUTH_DISABLE_LOGIN_FORM: "true"
+GF_FEATURE_TOGGLES_ENABLE: traceqlEditor tempoServiceGraph
+```
+
+### 9. docker-compose.yml
+
+**完整服务清单（10 个容器）**:
+
+| 服务 | 镜像 | 端口 | 说明 |
+|------|------|------|------|
+| mysql | mysql:8.0 | 3306 | 数据库 |
+| redis | redis:7-alpine | 6379 | 缓存 |
+| tempo | grafana/tempo:latest | 3200 | Trace 存储 |
+| loki | grafana/loki:3.0.0 | 3100 | 日志存储 |
+| prometheus | prom/prometheus:latest | 9090 | 指标存储 |
+| otel-collector | otel/opentelemetry-collector-contrib:latest | 4317, 4318 | 数据管道 |
+| grafana | grafana/grafana:latest | 3000 | 可视化 |
+| order-service | 本地构建 | 8080 | 订单服务 |
+| inventory-service | 本地构建 | 8081 | 库存服务 |
+| load-generator | alpine/curl | — | 流量生成 |
+
+**依赖关系和启动顺序**：用 depends_on + condition: service_healthy 控制。
+
+**网络**：所有服务在 `otel-demo` bridge 网络。
+
+**健康检查**：mysql、redis、tempo、loki、otel-collector、order-service、inventory-service 都要配 healthcheck。
+
+### 10. 流量生成器
+
+```yaml
+load-generator:
+  image: alpine/curl
+  depends_on:
+    order-service:
+      condition: service_healthy
+  restart: always
+  entrypoint: ["/bin/sh", "-c"]
+  command:
+    - |
+      echo "Waiting 15s for services to stabilize..."
+      sleep 15
+      echo "Starting continuous load generation..."
+      while true; do
+        # 查询所有订单
+        curl -s http://order-service:8080/api/orders > /dev/null 2>&1
+
+        # 查询单个订单（触发 Redis 缓存命中/未命中）
+        ID=$$(shuf -i 1-5 -n 1)
+        curl -s http://order-service:8080/api/orders/$$ID > /dev/null 2>&1
+
+        # 按用户查询
+        curl -s http://order-service:8080/api/orders/user/user-001 > /dev/null 2>&1
+
+        # 创建订单（跨服务调用 + DB + Redis）
+        SKU="SKU-00$$(shuf -i 1-4 -n 1)"
+        QTY=$$(shuf -i 1-3 -n 1)
+        curl -s -X POST http://order-service:8080/api/orders \
+          -H "Content-Type: application/json" \
+          -d "{\"userId\":\"user-$$(shuf -i 1-10 -n 1)\",\"sku\":\"$$SKU\",\"quantity\":$$QTY}" \
+          > /dev/null 2>&1
+
+        # 尝试购买库存为 0 的商品（触发 409）
+        curl -s -X POST http://order-service:8080/api/orders \
+          -H "Content-Type: application/json" \
+          -d '{"userId":"user-999","sku":"SKU-005","quantity":1}' \
+          > /dev/null 2>&1
+
+        # 调用慢接口
+        curl -s http://order-service:8080/api/orders/slow > /dev/null 2>&1 &
+
+        # 直接查 inventory 服务
+        curl -s http://inventory-service:8081/api/inventory > /dev/null 2>&1
+        curl -s http://inventory-service:8081/api/inventory/SKU-001 > /dev/null 2>&1
+
+        sleep 3
+      done
+```
+
+### 11. start.sh 一键启动脚本
+
+```bash
+#!/bin/bash
+set -e
+
+echo "========================================="
+echo " OTel Observability Demo - Quick Start"
+echo "========================================="
+
+echo "[1/3] Building Java microservices..."
+(cd order-service && mvn clean package -DskipTests -q)
+(cd inventory-service && mvn clean package -DskipTests -q)
+
+echo "[2/3] Starting all services with Docker Compose..."
+docker-compose up -d --build
+
+echo "[3/3] Waiting for services to be ready..."
+echo "  Waiting for Grafana..."
+until curl -sf http://localhost:3000/api/health > /dev/null 2>&1; do sleep 2; done
+echo "  Waiting for order-service..."
+until curl -sf http://localhost:8080/actuator/health > /dev/null 2>&1; do sleep 2; done
+echo "  Waiting for inventory-service..."
+until curl -sf http://localhost:8081/actuator/health > /dev/null 2>&1; do sleep 2; done
+
+echo ""
+echo "========================================="
+echo " All services are up and running!"
+echo "========================================="
+echo ""
+echo " Grafana:            http://localhost:3000"
+echo " Order Service:      http://localhost:8080"
+echo " Inventory Service:  http://localhost:8081"
+echo " Prometheus:         http://localhost:9090"
+echo " Tempo:              http://localhost:3200"
+echo ""
+echo " Chaos Engineering (故障注入):"
+echo "   查看状态:   curl http://localhost:8080/chaos/status"
+echo "   注入延迟:   curl -X POST http://localhost:8081/chaos/scenario/slow-db"
+echo "   注入错误:   curl -X POST http://localhost:8081/chaos/scenario/high-error-rate"
+echo "   级联故障:   curl -X POST http://localhost:8081/chaos/scenario/cascade-failure"
+echo "   重置恢复:   curl -X POST http://localhost:8081/chaos/reset"
+echo ""
+echo " Load generator is running automatically."
+echo " Wait ~1 minute for data to appear in Grafana."
+echo "========================================="
+```
+
+### 12. README.md
+
+包含以下内容：
+
+#### 项目简介
+本项目是一个完整的 OpenTelemetry + Grafana 可观测性演示环境，展示：
+- OTel Java Agent 零代码自动 instrumentation（HTTP、MySQL、Redis）
+- Metrics / Traces / Logs 三大信号的采集、存储和关联跳转
+- 从 Metrics（Exemplar）→ Trace → Logs 的完整排障闭环
+- 内置故障注入能力，可实时模拟各种故障场景
+
+#### 架构图（ASCII art，展示所有 10 个组件和数据流）
+
+#### 快速启动（./start.sh 或手动步骤）
+
+#### 验证步骤（6 步详细指南）
+
+**步骤 1：查看 Trace（含 MySQL 和 Redis span）**
+- Grafana → Explore → Tempo
+- TraceQL: `{resource.service.name="order-service" && name="POST /api/orders"}`
+- 预期看到的 span 瀑布图：HTTP span → 跨服务调用 span → MySQL SELECT/INSERT span → Redis GET/SET/DEL span
+
+**步骤 2：验证 Trace → Logs 跳转**
+- 在 trace 中点击 span → "Logs for this span" → 跳转到 Loki
+
+**步骤 3：验证 Logs → Trace 跳转**
+- Grafana → Explore → Loki → `{service_name="order-service"} |= "ERROR"` → 点击 traceID 链接
+
+**步骤 4：验证 Metrics → Trace 跳转（Exemplar）**
+- Grafana → Explore → Prometheus → 查询 P99 延迟 → 开启 Exemplars → 点击红点
+
+**步骤 5：查看 Service Graph（服务拓扑图）**
+- Grafana → Explore → Tempo → Service Graph tab
+
+**步骤 6：故障注入演练**
+
+演练场景 A — 数据库慢查询：
+```bash
+# 1. 对 inventory-service 注入 3 秒延迟
+curl -X POST http://localhost:8081/chaos/scenario/slow-db
+
+# 2. 等待 1 分钟观察 Grafana 面板变化：
+#    - P99 延迟飙升
+#    - 出现 exemplar 点在高延迟区域
+#    - 点击 exemplar 跳到 trace，看到 inventory-service 的 span 耗时 3s+
+
+# 3. 恢复正常
+curl -X POST http://localhost:8081/chaos/reset
+```
+
+演练场景 B — 级联故障：
+```bash
+# 1. 对 inventory-service 注入 80% 异常率
+curl -X POST http://localhost:8081/chaos/scenario/cascade-failure
+
+# 2. 观察：
+#    - inventory-service 错误率飙升
+#    - order-service 的创建订单接口也开始报错（因为依赖 inventory-service）
+#    - 在 trace 中看到 order-service → inventory-service 的调用链断裂
+
+# 3. 恢复
+curl -X POST http://localhost:8081/chaos/reset
+```
+
+演练场景 C — 自定义故障：
+```bash
+# 对 order-service 注入 2 秒延迟 + 30% 错误率
+curl -X POST http://localhost:8080/chaos/enable
+curl -X POST http://localhost:8080/chaos/latency \
+  -H "Content-Type: application/json" \
+  -d '{"latencyMs": 2000, "jitterMs": 500}'
+curl -X POST http://localhost:8080/chaos/exception \
+  -H "Content-Type: application/json" \
+  -d '{"rate": 0.3, "message": "Simulated database connection pool exhausted"}'
+```
+
+#### 常见问题排查
+- 服务启动失败：检查 MySQL 是否 ready（healthcheck）
+- 看不到 trace：检查 OTel Collector 日志 `docker-compose logs otel-collector`
+- Exemplar 不显示：确认 Prometheus 带了 `--enable-feature=exemplar-storage`
+- 日志没有 traceID：确认 logback-spring.xml 配置了 OpenTelemetry appender
+
+#### 清理
+```bash
+docker-compose down -v
+```
+
+## 重要注意事项
+
+1. Java 微服务除了 Logback OTel Appender 之外，**不引入任何 OTel SDK 依赖**，trace 和 metrics 全部由 javaagent 自动注入
+2. OTel Java Agent 会自动 instrument JDBC（MySQL）、Lettuce（Redis）、RestTemplate（HTTP），在 trace 中你会看到 SQL 语句（已脱敏）和 Redis 命令的独立 span
+3. ChaosMonkey 故障注入是纯应用层实现，不依赖任何外部工具，通过 REST API 运行时动态控制
+4. 所有配置文件必须完整可用，不能有占位符或省略号
+5. 确保 Grafana datasources.yaml 中三大数据源的关联跳转配置完整
+6. docker-compose 中 healthcheck 要配准确，避免服务依赖导致启动失败
+7. MySQL init.sql 挂载到 `/docker-entrypoint-initdb.d/` 目录自动初始化
+8. 请生成所有文件的完整内容，让我可以直接 `./start.sh` 一键跑起来
